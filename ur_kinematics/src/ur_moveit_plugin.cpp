@@ -72,9 +72,6 @@
 
 /* Author: Sachin Chitta, David Lu!!, Ugo Cupcic */
 
-#include <class_loader/class_loader.h>
-
-//#include <tf/transform_datatypes.h>
 #include <tf_conversions/tf_kdl.h>
 #include <kdl_parser/kdl_parser.hpp>
 
@@ -89,6 +86,7 @@
 #include <ur_kinematics/ur_kin.h>
 
 //register KDLKinematics as a KinematicsBase implementation
+#include <class_loader/class_loader.hpp>
 CLASS_LOADER_REGISTER_CLASS(ur_kinematics::URKinematicsPlugin, kinematics::KinematicsBase)
 
 namespace ur_kinematics
@@ -165,44 +163,30 @@ bool URKinematicsPlugin::checkConsistency(const KDL::JntArray& seed_state,
   return true;
 }
 
-bool URKinematicsPlugin::initialize(const std::string &robot_description,
+bool URKinematicsPlugin::initialize(const moveit::core::RobotModel &robot_model,
                                      const std::string& group_name,
                                      const std::string& base_frame,
-                                     const std::string& tip_frame,
+                                     const std::vector<std::string>& tip_frames,
                                      double search_discretization)
 {
-  setValues(robot_description, group_name, base_frame, tip_frame, search_discretization);
+  storeValues(robot_model,group_name,base_frame,tip_frames,search_discretization);
 
-  rdf_loader::RDFLoader rdf_loader(robot_description_);
-  const srdf::ModelSharedPtr &srdf = rdf_loader.getSRDF();
-  const urdf::ModelInterfaceSharedPtr &urdf_model = rdf_loader.getURDF();
-
-  if (!urdf_model || !srdf)
-  {
-    ROS_ERROR_NAMED("kdl","URDF and SRDF must be loaded for KDL kinematics solver to work.");
-    return false;
-  }
-
-  robot_model_.reset(new robot_model::RobotModel(urdf_model, srdf));
-
-  robot_model::JointModelGroup* joint_model_group = robot_model_->getJointModelGroup(group_name);
-  if (!joint_model_group)
-    return false;
+  joint_model_group_ = robot_model_->getJointModelGroup(group_name);
   
-  if(!joint_model_group->isChain())
+  
+  if(!joint_model_group_->isChain())
   {
     ROS_ERROR_NAMED("kdl","Group '%s' is not a chain", group_name.c_str());
     return false;
   }
-  if(!joint_model_group->isSingleDOFJoints())
+  if(!joint_model_group_->isSingleDOFJoints())
   {
     ROS_ERROR_NAMED("kdl","Group '%s' includes joints that have more than 1 DOF", group_name.c_str());
     return false;
   }
 
   KDL::Tree kdl_tree;
-
-  if (!kdl_parser::treeFromUrdfModel(*urdf_model, kdl_tree))
+  if (!kdl_parser::treeFromUrdfModel(*robot_model.getURDF(), kdl_tree))
   {
     ROS_ERROR_NAMED("kdl","Could not initialize tree object");
     return false;
@@ -213,13 +197,13 @@ bool URKinematicsPlugin::initialize(const std::string &robot_description,
     return false;
   }
 
-  dimension_ = joint_model_group->getActiveJointModels().size() + joint_model_group->getMimicJointModels().size();
-  for (std::size_t i=0; i < joint_model_group->getJointModels().size(); ++i)
+  dimension_ = joint_model_group_->getActiveJointModels().size() + joint_model_group_->getMimicJointModels().size();
+  for (std::size_t i=0; i < joint_model_group_->getJointModels().size(); ++i)
   {
-    if(joint_model_group->getJointModels()[i]->getType() == moveit::core::JointModel::REVOLUTE || joint_model_group->getJointModels()[i]->getType() == moveit::core::JointModel::PRISMATIC)
+    if(joint_model_group_->getJointModels()[i]->getType() == moveit::core::JointModel::REVOLUTE || joint_model_group_->getJointModels()[i]->getType() == moveit::core::JointModel::PRISMATIC)
     {
-      ik_chain_info_.joint_names.push_back(joint_model_group->getJointModelNames()[i]);
-      const std::vector<moveit_msgs::JointLimits> &jvec = joint_model_group->getJointModels()[i]->getVariableBoundsMsg();
+      ik_chain_info_.joint_names.push_back(joint_model_group_->getJointModelNames()[i]);
+      const std::vector<moveit_msgs::JointLimits> &jvec = joint_model_group_->getJointModels()[i]->getVariableBoundsMsg();
       ik_chain_info_.limits.insert(ik_chain_info_.limits.end(), jvec.begin(), jvec.end());
     }
   }
@@ -227,13 +211,13 @@ bool URKinematicsPlugin::initialize(const std::string &robot_description,
   fk_chain_info_.joint_names = ik_chain_info_.joint_names;
   fk_chain_info_.limits = ik_chain_info_.limits;
 
-  if(!joint_model_group->hasLinkModel(getTipFrame()))
+  if(!joint_model_group_->hasLinkModel(getTipFrame()))
   {
     ROS_ERROR_NAMED("kdl","Could not find tip name in joint group '%s'", group_name.c_str());
     return false;
   }
   ik_chain_info_.link_names.push_back(getTipFrame());
-  fk_chain_info_.link_names = joint_model_group->getLinkModelNames();
+  fk_chain_info_.link_names = joint_model_group_->getLinkModelNames();
 
   joint_min_.resize(ik_chain_info_.limits.size());
   joint_max_.resize(ik_chain_info_.limits.size());
@@ -256,10 +240,10 @@ bool URKinematicsPlugin::initialize(const std::string &robot_description,
   if(position_ik)
     ROS_INFO_NAMED("kdl","Using position only ik");
 
-  num_possible_redundant_joints_ = kdl_chain_.getNrOfJoints() - joint_model_group->getMimicJointModels().size() - (position_ik? 3:6);
+  num_possible_redundant_joints_ = kdl_chain_.getNrOfJoints() - joint_model_group_->getMimicJointModels().size() - (position_ik? 3:6);
 
   // Check for mimic joints
-  bool has_mimic_joints = joint_model_group->getMimicJointModels().size() > 0;
+  bool has_mimic_joints = joint_model_group_->getMimicJointModels().size() > 0;
   std::vector<unsigned int> redundant_joints_map_index;
 
   std::vector<kdl_kinematics_plugin::JointMimic> mimic_joints;
@@ -279,9 +263,9 @@ bool URKinematicsPlugin::initialize(const std::string &robot_description,
       ++joint_counter;
       continue;
     }
-    if (joint_model_group->hasJointModel(jm->getName()))
+    if (joint_model_group_->hasJointModel(jm->getName()))
     {
-      if (jm->getMimic() && joint_model_group->hasJointModel(jm->getMimic()->getName()))
+      if (jm->getMimic() && joint_model_group_->hasJointModel(jm->getMimic()->getName()))
       {
         kdl_kinematics_plugin::JointMimic mimic_joint;
         mimic_joint.reset(joint_counter);
@@ -297,7 +281,7 @@ bool URKinematicsPlugin::initialize(const std::string &robot_description,
   {
     if(!mimic_joints[i].active)
     {
-      const robot_model::JointModel* joint_model = joint_model_group->getJointModel(mimic_joints[i].joint_name)->getMimic();
+      const robot_model::JointModel* joint_model = joint_model_group_->getJointModel(mimic_joints[i].joint_name)->getMimic();
       for(std::size_t j=0; j < mimic_joints.size(); ++j)
       {
         if(mimic_joints[j].joint_name == joint_model->getName())
@@ -315,7 +299,6 @@ bool URKinematicsPlugin::initialize(const std::string &robot_description,
 
   // Store things for when the set of redundant joints may change
   position_ik_ = position_ik;
-  joint_model_group_ = joint_model_group;
   max_solver_iterations_ = max_solver_iterations;
   epsilon_ = epsilon;
 
